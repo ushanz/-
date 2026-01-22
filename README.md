@@ -1,7 +1,4 @@
 # 政策文本词频统计
-下面给你一份可以直接放到 GitHub 的 **README/说明文档**（你可以复制到 `README.md`）。它涵盖：用途、依赖、输入输出、工作流程、如何复用、常见坑与排错、以及 Gephi 怎么用这些表。
-
----
 
 ## 项目简介
 
@@ -102,9 +99,8 @@ KEYWORDS: Dict[str, List[str]] = {
 * value 是该类别下的一组关键词（keyword list）
 * **类别总词频 = 该类别下所有关键词词频之和**
 
-### 为什么要“清洗关键词”
+### 清洗关键词解释
 
-这段代码：
 
 ```python
 KEYWORDS[cat] = [k.strip() for k in kws if k and k.strip()]
@@ -160,7 +156,7 @@ KEYWORDS[cat] = [k.strip() for k in kws if k and k.strip()]
 
 ---
 
-## 输出文件说明（最重要）
+## 输出文件说明
 
 输出目录：`OUT_DIR`
 
@@ -208,9 +204,9 @@ KEYWORDS[cat] = [k.strip() for k in kws if k and k.strip()]
 
 ---
 
-## 使用方法（快速开始）
+## 使用方法
 
-1. 修改脚本顶部配置（只需要改这一段）：
+1. 修改脚本顶部配置：
 
 * `POLICY_ROOT`
 * `OUT_DIR`
@@ -260,12 +256,12 @@ D:/Anaconda/envs/yourenv/python.exe path/to/run_all_with_ocr.py
 
 ---
 
-## 设计选择说明
+## 其他说明
 
 * **不依赖 pytesseract**：直接调用 `tesseract.exe` 更可控，避免“路径被错误加引号”等问题
-* **先 LibreOffice 后 Word**：LibreOffice headless 更适合批量处理；Word COM 作为兜底
+* **先 LibreOffice 后 Word**：LibreOffice headless 更适合批量处理；Word COM 作为备选
 * **manifest.csv**：保证每个文件都有结果记录，防止漏文件、漏统计
-* **两种边权重**：binary 适合看“共现频率”，weighted(min) 更适合看“共现强度”
+* **两种边权重**：输出的有binary和weighted的表格，binary 适合看“共现频率”，weighted(min) 更适合看“共现强度”
 
 ---
 

@@ -1,0 +1,586 @@
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import sys
+import csv
+import time
+import shutil
+import hashlib
+import subprocess
+from pathlib import Path
+from itertools import combinations
+from typing import Dict, List, Tuple, Optional
+
+# ========================
+# 0) 你只需要改这里：路径与开关
+# ========================
+POLICY_ROOT = r"D:\Desktop\envenco\policy"
+OUT_DIR = r"D:\Desktop\envenco\txt_output_v4"
+TXT_DIR = os.path.join(OUT_DIR, "txt")
+
+# Tesseract（你已安装）
+TESSERACT_EXE = r"D:\Tesseract-OCR\tesseract.exe"
+TESSDATA_DIR = r"D:\Tesseract-OCR\tessdata"   # 必须是 tessdata 文件夹本身
+OCR_LANG_WANTED = "chi_sim+eng"               # 自动剔除缺失语言
+OCR_DPI = 300
+OCR_PSM = 6
+ENABLE_OCR_FOR_SCANNED_PDF = True
+
+# LibreOffice（你已安装在 D:\LibreOffice\program）
+LIBREOFFICE_PROGRAM_DIR = r"D:\LibreOffice\program"
+
+# 抽取为空（可能是扫描件）的判定阈值：太短就认为没文本层
+MIN_TEXT_LEN_FOR_PDF = 30
+
+# 生成 Gephi 网络
+OUTPUT_CATEGORY_NETWORK = True
+OUTPUT_KEYWORD_NETWORK = True
+
+# ========================
+# 1) 类别分组（用于 Gephi nodes 的 Group）
+# ========================
+CATEGORY_GROUP = {
+    "Regulations(法规/规章)": "Legal",
+    "Target responsibility system(目标责任制)": "Legal",
+    "Supervision and oversight(监督与管理)": "Legal",
+
+    "Tax incentives(税收激励)": "Economic",
+    "Pricing incentives(价格激励)": "Economic",
+    "Financing preferential policies(融资优惠政策)": "Economic",
+    "Competition-based government sponsorship(政府赞助/拨款)": "Economic",
+    "Carbon trade policy(碳贸易政策)": "Economic",
+
+    "Ad hoc taskforce(专项工作小组)": "Network",
+    "Public-public partnerships(公公合伙)": "Network",
+    "Public-private partnerships(公私合伙/PPP)": "Network",
+    "Voluntary participation(自愿参与)": "Network",
+
+    "Public information campaigns(公共信息运动/宣传)": "Communicative",
+    "Exhortation and education(劝诫与教育)": "Communicative",
+    "Public consultation(公众咨询)": "Communicative",
+    "Open government data(政府数据公开)": "Communicative",
+}
+
+# ========================
+# 2) 关键词词典（写死在代码里）
+# ========================
+KEYWORDS: Dict[str, List[str]] = {
+    "Regulations(法规/规章)": "法律、法规、条例、标准、禁止、强制、许可、规范、要求、准入".split("、"),
+    "Target responsibility system(目标责任制)": "责任、考核、挂钩、目标、指标、绩效、晋升、层层分解、签订".split("、"),
+    "Supervision and oversight(监督与管理)": "监督、监察、监测、检查、督察、监管、核查、抽查".split("、"),
+    "Tax incentives(税收激励)": "税、减免、退税、抵免、征收、税率、免税、附加税".split("、"),
+    "Pricing incentives(价格激励)": "价格、电价、费、差价、费率、阶梯价、补贴价、定价".split("、"),
+    "Financing preferential policies(融资优惠政策)": "贷款、利率、信贷、金融、融资、银行、贴息、绿色信贷".split("、"),
+    "Competition-based government sponsorship(政府赞助/拨款)": "补贴、补助、采购、资金、拨款、奖励、专项、补偿".split("、"),
+    "Carbon trade policy(碳贸易政策)": "碳、交易、市场、排放权、配额、CCER、履约、配额分配".split("、"),
+    "Ad hoc taskforce(专项工作小组)": "领导小组、工作组、联席会议、专班、协调、办公室、指挥部".split("、"),
+    "Public-public partnerships(公公合伙)": "国企参与、部门协作、机构间、协同、联动、跨部门".split("、"),
+    "Public-private partnerships(公私合伙/PPP)": "社会资本、私人部门、合资、特许经营、民营企业、PPP、BOT".split("、"),
+    "Voluntary participation(自愿参与)": "自愿、倡议、参与、社区、居民、家庭、志愿、协议".split("、"),
+    "Public information campaigns(公共信息运动/宣传)": "新闻、媒体、宣传、广告、标签、普及、发布、展示、公示".split("、"),
+    "Exhortation and education(劝诫与教育)": "教育、培训、劝导、倡导、文化、讲座、养成、意识".split("、"),
+    "Public consultation(公众咨询)": "专家、咨询、意见、听证、建议、座谈会、智库、论证".split("、"),
+    "Open government data(政府数据公开)": "公开、披露、平台、共享、透明、数字化、联网、发布系统".split("、"),
+}
+
+# 清洗关键词：去空格、去空项
+for cat, kws in list(KEYWORDS.items()):
+    KEYWORDS[cat] = [k.strip() for k in kws if k and k.strip()]
+
+# ========================
+# 3) 通用：隐藏窗口跑子进程（Windows）
+# ========================
+def run_hidden(cmd: List[str],
+               check: bool = False,
+               timeout: Optional[int] = None,
+               cwd: Optional[str] = None,
+               env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    kwargs = dict(
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        timeout=timeout,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    return subprocess.run(cmd, check=check, **kwargs)
+
+def ensure_dir(p: str) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def sha1_short(s: str, n: int = 10) -> str:
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:n]
+
+def save_csv(path: str, header: List[str], rows: List[List]) -> None:
+    ensure_dir(str(Path(path).parent))
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+def safe_rel_parts(file_path: Path, root: Path) -> Tuple[str, str, str]:
+    try:
+        rel = file_path.relative_to(root)
+        parts = rel.parts
+    except Exception:
+        parts = file_path.parts
+
+    root_type = parts[0] if len(parts) >= 1 else "unknown"
+    level1 = parts[1] if len(parts) >= 2 else ""
+    level2 = parts[2] if len(parts) >= 3 else ""
+    return root_type, level1, level2
+
+# ========================
+# 4) LibreOffice / Word / PDF 抽取
+# ========================
+def get_soffice_path() -> Optional[str]:
+    # 优先 soffice.com（更适合命令行），其次 soffice.exe
+    cand = [
+        str(Path(LIBREOFFICE_PROGRAM_DIR) / "soffice.com"),
+        str(Path(LIBREOFFICE_PROGRAM_DIR) / "soffice.exe"),
+    ]
+    for p in cand:
+        if os.path.exists(p):
+            return p
+    return None
+
+def extract_docx(path: str) -> str:
+    from docx import Document
+    doc = Document(path)
+    parts: List[str] = []
+
+    for p in doc.paragraphs:
+        if p.text and p.text.strip():
+            parts.append(p.text.strip())
+
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+            if cells:
+                parts.append("\t".join(cells))
+
+    return "\n".join(parts)
+
+def lo_convert_to_docx(src_path: str, out_dir: str) -> str:
+    soffice = get_soffice_path()
+    if not soffice:
+        raise RuntimeError(f"未找到 soffice：请确认 LibreOffice program 目录是否正确：{LIBREOFFICE_PROGRAM_DIR}")
+
+    ensure_dir(out_dir)
+
+    # 独立 profile，避免“用户配置锁”
+    lo_profile_dir = os.path.join(out_dir, "_lo_profile")
+    ensure_dir(lo_profile_dir)
+    lo_profile_uri = Path(lo_profile_dir).absolute().as_uri()
+
+    src = Path(src_path)
+    # 复制一份到 out_dir，避免奇怪路径/权限/重名
+    tmp_src = Path(out_dir) / f"{src.stem}_{sha1_short(str(src))}{src.suffix}"
+    shutil.copy2(src_path, tmp_src)
+
+    try:
+        cmd = [
+            soffice,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--norestore",
+            f"-env:UserInstallation={lo_profile_uri}",
+            "--convert-to",
+            "docx",
+            "--outdir",
+            out_dir,
+            str(tmp_src),
+        ]
+        r = run_hidden(cmd, check=True, timeout=120)
+        # 输出 docx 名通常是 tmp_src.stem + .docx
+        out_docx = Path(out_dir) / (tmp_src.stem + ".docx")
+        if out_docx.exists():
+            return str(out_docx)
+
+        # 兜底：拿 out_dir 最新的 docx
+        docxs = sorted(Path(out_dir).glob("*.docx"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if docxs:
+            return str(docxs[0])
+
+        raise RuntimeError(f"LibreOffice 转换后未找到 docx。stdout={r.stdout[:200]} stderr={r.stderr[:200]}")
+    finally:
+        try:
+            if tmp_src.exists():
+                tmp_src.unlink()
+        except Exception:
+            pass
+
+def word_convert_doc_to_docx(src_doc: str, out_docx: str) -> None:
+    import pythoncom
+    import win32com.client
+
+    pythoncom.CoInitialize()
+    wdFormatXMLDocument = 16
+    word = win32com.client.DispatchEx("Word.Application")
+    word.Visible = False
+    word.DisplayAlerts = 0
+    try:
+        doc = word.Documents.Open(
+            src_doc,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            ConfirmConversions=False,
+            OpenAndRepair=True,
+            NoEncodingDialog=True,
+        )
+        doc.SaveAs(out_docx, FileFormat=wdFormatXMLDocument)
+        doc.Close(False)
+    finally:
+        try:
+            word.Quit()
+        except Exception:
+            pass
+
+def kill_winword() -> None:
+    if os.name != "nt":
+        return
+    try:
+        run_hidden(["taskkill", "/F", "/IM", "WINWORD.EXE"], check=False, timeout=10)
+    except Exception:
+        pass
+
+def extract_doc(path: str, tmp_dir: str) -> str:
+    ensure_dir(tmp_dir)
+    base = Path(path).stem
+
+    # 1) 先用 LibreOffice（更稳定、不依赖 COM）
+    lo_err: Optional[str] = None
+    try:
+        docx_path = lo_convert_to_docx(path, tmp_dir)
+        return extract_docx(docx_path)
+    except Exception as e:
+        lo_err = str(e)
+
+    # 2) 再用 Word COM（你有 Word，但 COM 有时会 RPC 失败）
+    word_err: Optional[str] = None
+    out_docx_word = os.path.join(tmp_dir, f"{base}_{sha1_short(path)}.docx")
+    try:
+        import win32com.client  # noqa
+        try:
+            word_convert_doc_to_docx(path, out_docx_word)
+        except Exception:
+            # RPC 失败常见：残留 WINWORD。杀掉后重试一次
+            kill_winword()
+            time.sleep(1)
+            word_convert_doc_to_docx(path, out_docx_word)
+
+        return extract_docx(out_docx_word)
+    except Exception as e:
+        word_err = str(e)
+
+    raise RuntimeError(f"DOC 转换失败。LibreOffice错误：{lo_err}；Word错误：{word_err}")
+
+def detect_ocr_lang() -> Tuple[str, List[str]]:
+    wanted = [x.strip() for x in OCR_LANG_WANTED.split("+") if x.strip()]
+    existing = []
+    missing = []
+    for code in wanted:
+        td = os.path.join(TESSDATA_DIR, f"{code}.traineddata")
+        if os.path.exists(td):
+            existing.append(code)
+        else:
+            missing.append(code)
+
+    if not existing:
+        raise RuntimeError(f"tessdata 中找不到可用语言：wanted={wanted}；请检查 {TESSDATA_DIR}")
+    return "+".join(existing), missing
+
+def ocr_pdf_with_tesseract(pdf_path: str) -> str:
+    if not os.path.exists(TESSERACT_EXE):
+        raise RuntimeError(f"未找到 tesseract.exe：{TESSERACT_EXE}")
+    if not os.path.exists(TESSDATA_DIR):
+        raise RuntimeError(f"未找到 tessdata 目录：{TESSDATA_DIR}")
+
+    lang_used, _ = detect_ocr_lang()
+
+    # 强制覆盖环境变量，避免系统里被设置成带引号/错路径
+    env = os.environ.copy()
+    env["TESSDATA_PREFIX"] = TESSDATA_DIR
+
+    import fitz  # PyMuPDF
+    doc = fitz.open(pdf_path)
+
+    tmp_img_dir = os.path.join(OUT_DIR, "_tmp_ocr_images")
+    ensure_dir(tmp_img_dir)
+
+    texts: List[str] = []
+    for i, page in enumerate(doc):
+        # 渲染为 png（不依赖 Pillow）
+        pix = page.get_pixmap(dpi=OCR_DPI)
+        img_path = os.path.join(tmp_img_dir, f"p{i}_{sha1_short(pdf_path)}.png")
+        pix.save(img_path)
+
+        # tesseract input stdout -l chi_sim --psm 6 --tessdata-dir D:\...\tessdata
+        cmd = [
+            TESSERACT_EXE,
+            img_path,
+            "stdout",
+            "-l", lang_used,
+            "--psm", str(OCR_PSM),
+            "--oem", "1",
+            "--tessdata-dir", TESSDATA_DIR,   # 关键：不加引号
+        ]
+        r = run_hidden(cmd, check=False, timeout=180, env=env)
+        if r.returncode != 0:
+            raise RuntimeError(f"Tesseract OCR 失败：{r.stderr.strip()[:300]}")
+        t = (r.stdout or "").strip()
+        if t:
+            texts.append(t)
+
+        # 清理单页图片
+        try:
+            os.remove(img_path)
+        except Exception:
+            pass
+
+    return "\n".join(texts).strip()
+
+def extract_pdf(path: str) -> str:
+    # 先抽文本层
+    fitz_err = None
+    try:
+        import fitz
+        doc = fitz.open(path)
+        parts = []
+        for page in doc:
+            parts.append(page.get_text("text") or "")
+        text = "\n".join(parts).strip()
+        if len(text) >= MIN_TEXT_LEN_FOR_PDF:
+            return text
+    except Exception as e:
+        fitz_err = str(e)
+
+    # OCR 兜底
+    if ENABLE_OCR_FOR_SCANNED_PDF:
+        t_ocr = ocr_pdf_with_tesseract(path)
+        if len(t_ocr) >= MIN_TEXT_LEN_FOR_PDF:
+            return t_ocr
+
+    if fitz_err:
+        raise RuntimeError(f"PDF 抽取失败。PyMuPDF错误：{fitz_err}")
+    raise RuntimeError("PDF 抽取几乎为空：可能是扫描件且 OCR 未配置成功。")
+
+def extract_text(path: str, tmp_dir: str) -> str:
+    ext = Path(path).suffix.lower()
+    if ext == ".docx":
+        return extract_docx(path)
+    if ext == ".doc":
+        return extract_doc(path, tmp_dir=tmp_dir)
+    if ext == ".pdf":
+        return extract_pdf(path)
+    raise RuntimeError(f"不支持的格式：{ext}")
+
+# ========================
+# 5) 计数与网络
+# ========================
+def build_keyword_patterns(category_to_keywords: Dict[str, List[str]]) -> Dict[str, re.Pattern]:
+    uniq = set()
+    for kws in category_to_keywords.values():
+        for kw in kws:
+            uniq.add(kw)
+    return {kw: re.compile(re.escape(kw)) for kw in uniq}
+
+def count_all(text: str,
+              category_to_keywords: Dict[str, List[str]],
+              patterns: Dict[str, re.Pattern]
+              ) -> Tuple[List[Tuple[str, str, int]], Dict[str, int], Dict[str, int]]:
+    keyword_rows: List[Tuple[str, str, int]] = []
+    category_totals: Dict[str, int] = {}
+    file_kw_node_counts: Dict[str, int] = {}
+
+    if not text:
+        for cat in category_to_keywords:
+            category_totals[cat] = 0
+        return keyword_rows, category_totals, file_kw_node_counts
+
+    for cat, kws in category_to_keywords.items():
+        total = 0
+        for kw in kws:
+            c = len(patterns[kw].findall(text))
+            if c > 0:
+                keyword_rows.append((cat, kw, c))
+                node_id = f"{cat}::{kw}"
+                file_kw_node_counts[node_id] = file_kw_node_counts.get(node_id, 0) + c
+                total += c
+        category_totals[cat] = total
+
+    return keyword_rows, category_totals, file_kw_node_counts
+
+# ========================
+# 6) 主流程：全量扫描 POLICY_ROOT
+# ========================
+def main() -> None:
+    start = time.time()
+
+    print("=== Preflight ===")
+    print("Python:", sys.executable)
+    print("POLICY_ROOT:", POLICY_ROOT)
+    print("OUT_DIR:", OUT_DIR)
+
+    # soffice 路径
+    soffice = get_soffice_path()
+    print("LibreOffice soffice:", soffice if soffice else f"NOT FOUND in {LIBREOFFICE_PROGRAM_DIR}")
+
+    # tesseract 语言检查
+    try:
+        lang_used, missing = detect_ocr_lang()
+        print(f"Tesseract lang used: {lang_used} ; missing: {missing}")
+    except Exception as e:
+        print("Tesseract lang check FAIL:", e)
+
+    ensure_dir(OUT_DIR)
+    ensure_dir(TXT_DIR)
+
+    root = Path(POLICY_ROOT)
+    if not root.exists():
+        print("ERROR: 找不到 POLICY_ROOT:", POLICY_ROOT)
+        return
+
+    exts = {".pdf", ".doc", ".docx"}
+    files: List[Path] = []
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in exts and not p.name.startswith("~$"):
+            files.append(p)
+
+    print(f"\n发现待处理文件数：{len(files)}")
+
+    patterns = build_keyword_patterns(KEYWORDS)
+
+    tmp_dir = os.path.join(OUT_DIR, "_tmp_docx")
+    ensure_dir(tmp_dir)
+
+    keyword_counts_long: List[List] = []
+    category_counts_long: List[List] = []
+    category_wide_rows: List[dict] = []
+    manifest_rows: List[List] = []
+
+    cat_node_total = {cat: 0 for cat in KEYWORDS}
+    cat_node_docs = {cat: 0 for cat in KEYWORDS}
+    cat_edge_bin: Dict[Tuple[str, str], int] = {}
+    cat_edge_minw: Dict[Tuple[str, str], int] = {}
+
+    kw_node_total: Dict[str, int] = {}
+    kw_node_docs: Dict[str, int] = {}
+    kw_edge_bin: Dict[Tuple[str, str], int] = {}
+    kw_edge_minw: Dict[Tuple[str, str], int] = {}
+
+    success = 0
+    failed = 0
+
+    for idx, f in enumerate(files, 1):
+        f_str = str(f)
+        root_type, level1, level2 = safe_rel_parts(f, root)
+        ext = f.suffix.lower()
+
+        try:
+            text = (extract_text(f_str, tmp_dir=tmp_dir) or "").strip()
+
+            out_name = f"{f.stem}_{sha1_short(f_str)}.txt"
+            out_txt = os.path.join(TXT_DIR, out_name)
+            with open(out_txt, "w", encoding="utf-8", errors="ignore") as w:
+                w.write(text)
+
+            kw_rows, cat_totals, file_kw_node_counts = count_all(text, KEYWORDS, patterns)
+
+            for cat, kw, c in kw_rows:
+                keyword_counts_long.append([f_str, root_type, level1, level2, cat, kw, c])
+
+            wide_line = {"file_path": f_str, "root_type": root_type, "level1": level1, "level2": level2}
+            for cat, total in cat_totals.items():
+                category_counts_long.append([f_str, root_type, level1, level2, cat, total])
+                wide_line[cat] = total
+                cat_node_total[cat] += int(total)
+                if int(total) > 0:
+                    cat_node_docs[cat] += 1
+            category_wide_rows.append(wide_line)
+
+            if OUTPUT_CATEGORY_NETWORK:
+                present_cats = [cat for cat in KEYWORDS if cat_totals.get(cat, 0) > 0]
+                for a, b in combinations(sorted(present_cats), 2):
+                    cat_edge_bin[(a, b)] = cat_edge_bin.get((a, b), 0) + 1
+                    cat_edge_minw[(a, b)] = cat_edge_minw.get((a, b), 0) + min(cat_totals[a], cat_totals[b])
+
+            if OUTPUT_KEYWORD_NETWORK:
+                present_nodes = sorted(file_kw_node_counts.keys())
+                for node_id, c in file_kw_node_counts.items():
+                    kw_node_total[node_id] = kw_node_total.get(node_id, 0) + int(c)
+                    kw_node_docs[node_id] = kw_node_docs.get(node_id, 0) + 1
+                for a, b in combinations(present_nodes, 2):
+                    kw_edge_bin[(a, b)] = kw_edge_bin.get((a, b), 0) + 1
+                    kw_edge_minw[(a, b)] = kw_edge_minw.get((a, b), 0) + min(file_kw_node_counts[a], file_kw_node_counts[b])
+
+            manifest_rows.append([f_str, root_type, level1, level2, ext, "OK", len(text), out_txt, ""])
+            success += 1
+            print(f"[{idx}/{len(files)} OK] {f_str}")
+
+        except Exception as e:
+            manifest_rows.append([f_str, root_type, level1, level2, ext, "FAIL", 0, "", str(e)])
+            failed += 1
+            print(f"[{idx}/{len(files)} FAIL] {f_str} -> {e}")
+
+    manifest_csv = os.path.join(OUT_DIR, "manifest.csv")
+    save_csv(manifest_csv, ["file_path", "root_type", "level1", "level2", "ext", "status", "text_len", "txt_file", "error"], manifest_rows)
+
+    keyword_long_csv = os.path.join(OUT_DIR, "keyword_counts_long.csv")
+    save_csv(keyword_long_csv, ["file_path", "root_type", "level1", "level2", "category", "keyword", "count"], keyword_counts_long)
+
+    category_long_csv = os.path.join(OUT_DIR, "category_counts_long.csv")
+    save_csv(category_long_csv, ["file_path", "root_type", "level1", "level2", "category", "category_total"], category_counts_long)
+
+    category_wide_csv = os.path.join(OUT_DIR, "category_counts_wide.csv")
+    cats = list(KEYWORDS.keys())
+    header = ["file_path", "root_type", "level1", "level2"] + cats
+    rows = []
+    for line in category_wide_rows:
+        rows.append([line.get("file_path", ""), line.get("root_type", ""), line.get("level1", ""), line.get("level2", "")] + [line.get(cat, 0) for cat in cats])
+    save_csv(category_wide_csv, header, rows)
+
+    if OUTPUT_CATEGORY_NETWORK:
+        gephi_cat_nodes_csv = os.path.join(OUT_DIR, "gephi_nodes_categories.csv")
+        node_rows = []
+        for cat in KEYWORDS:
+            node_rows.append([cat, cat, CATEGORY_GROUP.get(cat, "Other"), cat_node_total.get(cat, 0), cat_node_docs.get(cat, 0)])
+        save_csv(gephi_cat_nodes_csv, ["Id", "Label", "Group", "TotalCount", "DocCount"], node_rows)
+
+        gephi_cat_edges_bin_csv = os.path.join(OUT_DIR, "gephi_edges_categories_binary.csv")
+        save_csv(gephi_cat_edges_bin_csv, ["Source", "Target", "Weight"], [[a, b, w] for (a, b), w in cat_edge_bin.items()])
+
+        gephi_cat_edges_w_csv = os.path.join(OUT_DIR, "gephi_edges_categories_weighted.csv")
+        save_csv(gephi_cat_edges_w_csv, ["Source", "Target", "Weight"], [[a, b, w] for (a, b), w in cat_edge_minw.items()])
+
+    if OUTPUT_KEYWORD_NETWORK:
+        gephi_kw_nodes_csv = os.path.join(OUT_DIR, "gephi_nodes_keywords.csv")
+        node_rows = []
+        for node_id, total in sorted(kw_node_total.items(), key=lambda x: -x[1]):
+            cat, kw = node_id.split("::", 1) if "::" in node_id else ("", node_id)
+            node_rows.append([node_id, kw, cat, CATEGORY_GROUP.get(cat, "Other"), total, kw_node_docs.get(node_id, 0)])
+        save_csv(gephi_kw_nodes_csv, ["Id", "Label", "Category", "Group", "TotalCount", "DocCount"], node_rows)
+
+        gephi_kw_edges_bin_csv = os.path.join(OUT_DIR, "gephi_edges_keywords_binary.csv")
+        save_csv(gephi_kw_edges_bin_csv, ["Source", "Target", "Weight"], [[a, b, w] for (a, b), w in kw_edge_bin.items()])
+
+        gephi_kw_edges_w_csv = os.path.join(OUT_DIR, "gephi_edges_keywords_weighted.csv")
+        save_csv(gephi_kw_edges_w_csv, ["Source", "Target", "Weight"], [[a, b, w] for (a, b), w in kw_edge_minw.items()])
+
+    cost = time.time() - start
+    print("\n=== Done ===")
+    print("总文件数：", len(files))
+    print("成功：", success)
+    print("失败：", failed)
+    print("耗时(秒)：", round(cost, 2))
+    print("输出目录：", OUT_DIR)
+    print("manifest：", manifest_csv)
+
+if __name__ == "__main__":
+    main()
